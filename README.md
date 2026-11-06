@@ -16,7 +16,8 @@ clock. So this skill gives the agent a measure of time:
   frame it happens and how its pace rises and falls; the stretches where it holds still; its sound's hits and beat.
 - `measure.mjs compare <reference> <render>` measures the remake against it: every cut, change and hit matched with its
   offset in frames, each change's pace and length, a rhythm score, each shot's palette and layout (which hold when only
-  the content changed), how alike the frames are, and side-by-side pictures of where they differ most.
+  the content changed), how alike the frames are, side-by-side pictures of where they differ most, and what of the reference
+  is in the remake: its frames, its sound, a clip from `references/`, runs of its words.
 
 The brief says what the remake must be. Pages make what pages make exactly (text, graphics, interfaces, motion), and
 what was filmed stays filmed: the person's footage, or footage a video service makes from the reference's shot.

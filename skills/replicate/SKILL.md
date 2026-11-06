@@ -39,9 +39,9 @@ its own clock, or a filmed shot redrawn as a drawing.
   change's place and pace, its holds, its sound's hits and beat.
 - `npx openfilm look <video> a-b` shows a stretch frame by frame, `t` one frame.
 - `node <this skill's folder>/scripts/measure.mjs compare <reference> <render>`: the film against the reference: cuts,
-  changes and hits with their offsets, each change's pace, each shot's palette and layout, how alike the frames are, and
-  side-by-side pictures where they differ most. Render first (`npx openfilm render`); `--fit` when lengths differ on
-  purpose.
+  changes and hits with their offsets, each change's pace, each shot's palette and layout, how alike the frames are,
+  side-by-side pictures of the worst, and any of the reference in it. Render first (`npx openfilm render`); `--fit`
+  when lengths differ.
 - `npx openfilm get`: pictures made from the reference's frames with what to change (`--ref`, `--mask`, `--markup`);
   video clips from a stretch of the reference (`--video`), from frames and pictures, or of a person speaking (the words
   in the prompt and `--voice`, or a recording with `--audio`); clips and pictures found on the web; voice, music, sound

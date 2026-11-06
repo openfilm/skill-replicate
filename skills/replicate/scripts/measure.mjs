@@ -3,14 +3,17 @@
 // where it holds still, and where its sound hits. And a remake measured against it, frame by frame.
 //
 //   node measure.mjs study <video> [--out <folder>]
-//   node measure.mjs compare <reference> <remake> [--out <folder>] [--fit]
+//   node measure.mjs compare <reference> <remake> [--out <folder>] [--fit] [--film <film.html>]
 //
 // study writes study.md (to read) and study.json (every number) into --out, by default a folder named after the video
 // beside it. compare writes compare.md, compare.json and side-by-side pictures (reference left, remake right), by
 // default into compare/ beside the reference. --fit compares a remake of another length with its times scaled to the
-// reference's. Needs ffmpeg and ffprobe on the PATH, as OpenFilm does.
+// reference's. It also says what of the reference is in the remake, and exits 1 when a picture, a sound or a file of it
+// is; --film is the remake's film.html when it is not in a folder above the render. Needs ffmpeg and ffprobe on the
+// PATH, as OpenFilm does.
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 
 /* the size every frame is measured at: small enough to be fast and to forgive a pixel's difference */
@@ -136,10 +139,10 @@ function readFrames(file, { fps, w, h, keep = false }) {
   });
 }
 
-/** A file's sound, mono at RATE, or null when it has none. @param {string} file @returns {Promise<Float32Array | null>} */
-function readSound(file) {
+/** A file's sound, mono at `rate`, or null when it has none. @param {string} file @returns {Promise<Float32Array | null>} */
+function readSound(file, rate = RATE) {
   return new Promise((done) => {
-    const proc = spawn('ffmpeg', ['-v', 'error', '-i', file, '-vn', '-ac', '1', '-ar', String(RATE), '-f', 'f32le', '-'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const proc = spawn('ffmpeg', ['-v', 'error', '-i', file, '-vn', '-ac', '1', '-ar', String(rate), '-f', 'f32le', '-'], { stdio: ['ignore', 'pipe', 'ignore'] });
     /** @type {Buffer[]} */ const parts = [];
     proc.stdout.on('data', (c) => parts.push(c));
     proc.on('error', () => done(null));
@@ -640,8 +643,454 @@ function sideBySide(/** @type {string} */ refFile, /** @type {number} */ a, /** 
   return r.status === 0;
 }
 
-/** @param {string} refFile @param {string} remakeFile @param {{ out?: string, fit?: boolean }} o */
-async function compare(refFile, remakeFile, { out, fit = false }) {
+// ---------------------------------------------------------------- the reference in the remake
+
+/* frames are hashed squeezed to this square, whatever their shape */
+const SIDE = 256;
+/* a frame of the reference: hashes this close (of 63 bits), then high-passed pixels this alike, on a frame with this much detail */
+const HASH_NEAR = 12;
+const PIXEL_ALIKE = 0.8;
+const DETAIL = 6;
+/* its sound, at 16 kHz with a 32 ms window every 10 ms: this many landmarks at one offset within LEAK_SPAN seconds */
+const LEAK_RATE = 16000;
+const LEAK_WINDOW = 512;
+const LEAK_HOP = 160;
+const LEAK_BINS = LEAK_WINDOW / 2 + 1;
+const LANDMARKS = 12;
+const LEAK_SPAN = 3;
+/* a run of its words worth naming, in characters (CJK) or words */
+const RUN_CJK = 12;
+const RUN_WORDS = 8;
+
+/**
+ * @typedef {{ x: number, y: number, w: number, h: number }} Crop
+ * @typedef {{ t: number, hash: Uint32Array, small: Uint8Array, cropHash?: Uint32Array, cropSmall?: Uint8Array }} Print
+ * @typedef {{ t: number, end: number, text: string }} Word
+ */
+
+/** Box-averages `crop` of a size × size grey picture into out × out. @param {Uint8Array} src @param {number} size @param {Crop} crop @param {number} out */
+function shrink(src, size, crop, out) {
+  const dst = new Uint8Array(out * out);
+  const x0 = crop.x * size, y0 = crop.y * size, cw = (crop.w * size) / out, ch = (crop.h * size) / out;
+  for (let oy = 0; oy < out; oy++) {
+    const ya = Math.floor(y0 + oy * ch), yb = Math.max(ya + 1, Math.floor(y0 + (oy + 1) * ch));
+    for (let ox = 0; ox < out; ox++) {
+      const xa = Math.floor(x0 + ox * cw), xb = Math.max(xa + 1, Math.floor(x0 + (ox + 1) * cw));
+      let sum = 0;
+      for (let y = ya; y < yb; y++) for (let x = xa; x < xb; x++) sum += src[y * size + x];
+      dst[oy * out + ox] = Math.round(sum / ((yb - ya) * (xb - xa)));
+    }
+  }
+  return dst;
+}
+
+const COS = Array.from({ length: 8 }, (_, k) => Float64Array.from({ length: 32 }, (_, n) => Math.cos((Math.PI * (2 * n + 1) * k) / 64)));
+
+/** A 63-bit perceptual hash (the lowest 8 × 8 DCT terms against their median, DC left out) of a 32 × 32 picture. @param {Uint8Array} px */
+function phash(px) {
+  const rows = new Float64Array(32 * 8);
+  for (let y = 0; y < 32; y++) {
+    for (let k = 0; k < 8; k++) {
+      let s = 0;
+      for (let x = 0; x < 32; x++) s += px[y * 32 + x] * COS[k][x];
+      rows[y * 8 + k] = s;
+    }
+  }
+  const terms = new Float64Array(64);
+  for (let ky = 0; ky < 8; ky++) {
+    for (let kx = 0; kx < 8; kx++) {
+      let s = 0;
+      for (let y = 0; y < 32; y++) s += COS[ky][y] * rows[y * 8 + kx];
+      terms[ky * 8 + kx] = s;
+    }
+  }
+  const middle = [...terms.subarray(1)].sort((a, b) => a - b)[31];
+  const hash = new Uint32Array(2);
+  for (let i = 1; i < 64; i++) if (terms[i] > middle) hash[i >> 5] |= 1 << (i & 31);
+  return hash;
+}
+
+const bits = (/** @type {number} */ v) => { v -= (v >>> 1) & 0x55555555; v = (v & 0x33333333) + ((v >>> 2) & 0x33333333); return (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24; };
+const distance = (/** @type {Uint32Array} */ a, /** @type {Uint32Array} */ b) => bits(a[0] ^ b[0]) + bits(a[1] ^ b[1]);
+
+/**
+ * Every frame's hash and 48 × 48 grey copy; `crop` adds those of that part, to find one video shown inside the other.
+ * @param {string} file @param {number} fps @param {Crop} [crop] @returns {Promise<Print[]>}
+ */
+function readPrints(file, fps, crop) {
+  return new Promise((done, failed) => {
+    const size = SIDE * SIDE;
+    const whole = { x: 0, y: 0, w: 1, h: 1 };
+    /** @type {Print[]} */ const prints = [];
+    const take = (/** @type {Uint8Array} */ g) => {
+      /** @type {Print} */
+      const print = { t: prints.length / fps, hash: phash(shrink(g, SIDE, whole, 32)), small: shrink(g, SIDE, whole, 48) };
+      if (crop) { print.cropHash = phash(shrink(g, SIDE, crop, 32)); print.cropSmall = shrink(g, SIDE, crop, 48); }
+      prints.push(print);
+    };
+    const proc = spawn('ffmpeg', ['-v', 'error', '-i', file, '-an', '-vf', `fps=${fps},scale=${SIDE}:${SIDE}:flags=area,format=gray`, '-f', 'rawvideo', '-'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let pending = Buffer.alloc(0);
+    let errors = '';
+    proc.stdout.on('data', (/** @type {Buffer} */ chunk) => {
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      let at = 0;
+      for (; at + size <= pending.length; at += size) take(pending.subarray(at, at + size));
+      pending = pending.subarray(at);
+    });
+    proc.stderr.on('data', (chunk) => { errors += chunk; });
+    proc.on('error', (e) => failed(new Error(`ffmpeg: ${e.message}`)));
+    proc.on('close', (code) => (code === 0 ? done(prints) : failed(new Error(`ffmpeg could not read ${file}: ${errors.trim()}`))));
+  });
+}
+
+/** A 48 × 48 grey picture less its 3 × 3 blur, and how much detail that leaves. @param {Uint8Array} px */
+function highPass(px) {
+  const out = new Float32Array(48 * 48);
+  let energy = 0;
+  for (let y = 0; y < 48; y++) {
+    for (let x = 0; x < 48; x++) {
+      let sum = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const yy = y + dy, xx = x + dx;
+          if (yy < 0 || yy >= 48 || xx < 0 || xx >= 48) continue;
+          sum += px[yy * 48 + xx];
+          n++;
+        }
+      }
+      const v = px[y * 48 + x] - sum / n;
+      out[y * 48 + x] = v;
+      energy += v * v;
+    }
+  }
+  return { px: out, detail: energy / out.length };
+}
+
+const alike = (/** @type {Float32Array} */ a, /** @type {Float32Array} */ b) => {
+  let ab = 0, aa = 0, bb = 0;
+  for (let i = 0; i < a.length; i++) { ab += a[i] * b[i]; aa += a[i] * a[i]; bb += b[i] * b[i]; }
+  return aa && bb ? ab / Math.sqrt(aa * bb) : 0;
+};
+
+/** Times within `gap` of each other as spans: where they are in the reference, how many, their best score. */
+function spans(/** @type {{ t: number, refT: number, score: number }[]} */ hits, /** @type {number} */ gap) {
+  /** @type {{ from: number, to: number, refFrom: number, count: number, score: number }[]} */
+  const out = [];
+  for (const h of hits.sort((a, b) => a.t - b.t)) {
+    const last = out[out.length - 1];
+    if (last && h.t - last.to <= gap) { last.to = h.t; last.count++; last.score = Math.max(last.score, h.score); }
+    else out.push({ from: h.t, to: h.t, refFrom: h.refT, count: 1, score: h.score });
+  }
+  return out;
+}
+
+/** The remake's frames that are frames of the reference, whole or cropped either way, as spans. @param {Print[]} ref @param {Print[]} remake */
+function leakedPictures(ref, remake) {
+  const cache = new Map();
+  const hp = (/** @type {Uint8Array} */ px) => { let v = cache.get(px); if (!v) cache.set(px, (v = highPass(px))); return v; };
+  const hits = [];
+  for (const f of remake) {
+    let best = { score: 0, refT: 0 };
+    for (const [hash, small, refHash, refSmall] of /** @type {any[]} */ ([[f.hash, f.small, 'hash', 'small'], [f.hash, f.small, 'cropHash', 'cropSmall'], [f.cropHash, f.cropSmall, 'hash', 'small']])) {
+      if (!hash) continue;
+      const mine = hp(small);
+      if (mine.detail < DETAIL) continue;
+      for (const r of /** @type {any[]} */ (ref)) {
+        if (!r[refHash] || distance(hash, r[refHash]) > HASH_NEAR) continue;
+        const theirs = hp(r[refSmall]);
+        if (theirs.detail < DETAIL) continue;
+        const score = alike(mine.px, theirs.px);
+        if (score > best.score) best = { score, refT: r.t };
+      }
+    }
+    if (best.score >= PIXEL_ALIKE) hits.push({ t: f.t, refT: best.refT, score: best.score });
+  }
+  return spans(hits, 0.25);
+}
+
+/** Log magnitudes of a sound, one row per step. @param {Float32Array | null} samples */
+function spectrum(samples) {
+  const steps = samples && samples.length >= LEAK_WINDOW ? Math.floor((samples.length - LEAK_WINDOW) / LEAK_HOP) + 1 : 0;
+  const mags = new Float32Array(steps * LEAK_BINS);
+  const hann = Float64Array.from({ length: LEAK_WINDOW }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / LEAK_WINDOW));
+  const re = new Float64Array(LEAK_WINDOW), im = new Float64Array(LEAK_WINDOW);
+  for (let s = 0; s < steps; s++) {
+    for (let i = 0; i < LEAK_WINDOW; i++) { re[i] = /** @type {Float32Array} */ (samples)[s * LEAK_HOP + i] * hann[i]; im[i] = 0; }
+    fft(re, im);
+    for (let f = 0; f < LEAK_BINS; f++) mags[s * LEAK_BINS + f] = Math.log1p((100 * Math.hypot(re[f], im[f])) / (LEAK_WINDOW / 2));
+  }
+  return { steps, mags };
+}
+
+/** Spectral landmarks: pairs of peaks, as key → the steps where they start. @param {{ steps: number, mags: Float32Array }} s */
+function landmarks({ steps, mags }) {
+  /** @type {{ s: number, f: number, v: number }[][]} */
+  const byStep = [];
+  for (let s = 0; s < steps; s++) {
+    const row = mags.subarray(s * LEAK_BINS, (s + 1) * LEAK_BINS);
+    const mean = row.reduce((a, b) => a + b, 0) / LEAK_BINS;
+    const local = [];
+    for (let f = 6; f < 200; f++) {
+      if (row[f] < mean + 0.5) continue;
+      let peak = true;
+      for (let g = f - 3; g <= f + 3; g++) if (g !== f && row[g] >= row[f]) peak = false;
+      if (peak) local.push({ s, f, v: row[f] });
+    }
+    byStep.push(local.sort((a, b) => b.v - a.v).slice(0, 5));
+  }
+  const kept = [];
+  for (let s = 0; s < steps; s++) {
+    for (const p of byStep[s]) {
+      let best = true;
+      for (let r = Math.max(0, s - 4); r <= Math.min(steps - 1, s + 4) && best; r++) {
+        for (const q of byStep[r]) if (q !== p && Math.abs(q.f - p.f) <= 3 && q.v > p.v) { best = false; break; }
+      }
+      if (best) kept.push(p);
+    }
+  }
+  /** @type {Map<number, number[]>} */
+  const keys = new Map();
+  for (let i = 0; i < kept.length; i++) {
+    let made = 0;
+    for (let j = i + 1; j < kept.length && made < 5; j++) {
+      const dt = kept[j].s - kept[i].s;
+      if (dt > 48) break;
+      if (dt < 2 || Math.abs(kept[j].f - kept[i].f) > 32) continue;
+      const key = (kept[i].f << 14) | (kept[j].f << 6) | dt;
+      const list = keys.get(key);
+      if (list) list.push(kept[i].s); else keys.set(key, [kept[i].s]);
+      made++;
+    }
+  }
+  return keys;
+}
+
+/** The stretches of the remake whose sound is the reference's: many landmarks at one offset. @param {Map<number, number[]>} ref @param {Map<number, number[]>} remake */
+function leakedSound(ref, remake) {
+  const stepTime = (/** @type {number} */ s) => (s * LEAK_HOP + LEAK_WINDOW / 2) / LEAK_RATE;
+  /** @type {Map<number, number[]>} */
+  const byOffset = new Map();
+  for (const [key, steps] of remake) {
+    const theirs = ref.get(key);
+    if (!theirs) continue;
+    for (const s of steps) {
+      for (const r of theirs) {
+        const list = byOffset.get(r - s);
+        if (list) list.push(s); else byOffset.set(r - s, [s]);
+      }
+    }
+  }
+  const span = (LEAK_SPAN * LEAK_RATE) / LEAK_HOP;
+  const hits = [];
+  for (const [off, steps] of byOffset) {
+    const near = [...new Set([...steps, ...(byOffset.get(off - 1) ?? []), ...(byOffset.get(off + 1) ?? [])])].sort((a, b) => a - b);
+    if (near.length < LANDMARKS) continue;
+    const inside = new Uint8Array(near.length);
+    for (let i = 0, j = 0; j < near.length; j++) {
+      while (near[j] - near[i] > span) i++;
+      if (j - i + 1 >= LANDMARKS) inside.fill(1, i, j + 1);
+    }
+    near.forEach((s, k) => { if (inside[k]) hits.push({ t: stepTime(s), refT: stepTime(s + off), score: 1 }); });
+  }
+  return spans(hits, LEAK_SPAN).map((s) => ({ ...s, to: s.to + LEAK_WINDOW / LEAK_RATE }));
+}
+
+/** `00:00:01.250` or `00:01.250` → seconds. @param {string} stamp */
+const seconds = (stamp) => {
+  const parts = stamp.trim().split(':').map(Number);
+  return parts.length < 2 || parts.some((n) => !Number.isFinite(n)) ? NaN : parts.reduce((acc, n) => acc * 60 + n, 0);
+};
+
+/** The words a WebVTT times: a cue's timestamp tags start its words; a cue without them is one. @param {string} body */
+function vttWords(body) {
+  /** @type {Word[]} */
+  const words = [];
+  for (const block of body.replace(/^﻿/, '').replace(/\r/g, '').split(/\n{2,}/)) {
+    const rows = block.split('\n');
+    const timing = rows.findIndex((r) => r.includes('-->'));
+    if (timing < 0 || /^(NOTE|STYLE|REGION)\b/.test(rows[0] ?? '')) continue;
+    const [a, b] = rows[timing].split('-->');
+    const start = seconds(a), end = seconds(b.trim().split(/\s+/)[0] ?? '');
+    if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+    /** @type {Word[]} */
+    const cue = [];
+    let at = start, fresh = true;
+    for (const [, tag, chunk] of rows.slice(timing + 1).join(' ').matchAll(/<([^>]*)>|([^<]+)/g)) {
+      if (tag !== undefined) {
+        const s = seconds(tag);
+        if (Number.isFinite(s)) { at = s; fresh = true; }
+        continue;
+      }
+      const text = chunk.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
+      if (!text.trim()) continue;
+      if (fresh || !cue.length) cue.push({ t: at, end, text: text.trim() });
+      else cue[cue.length - 1].text += text;
+      fresh = false;
+    }
+    cue.forEach((w, i) => { w.end = i + 1 < cue.length ? cue[i + 1].t : Math.max(end, w.t); w.text = w.text.replace(/\s+/g, ' ').trim(); });
+    words.push(...cue);
+  }
+  return words.sort((x, y) => x.t - y.t);
+}
+
+/** A media file's transcript: the WebVTT beside it with the same name. @param {string} file */
+const transcriptOf = (file) => file.slice(0, file.length - extname(file).length) + '.vtt';
+
+/** film.html's clips: element, file (relative to film.html), in and out points, place, speed, shown, heard. @param {string} html */
+function clips(html) {
+  const body = readFileSync(html, 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+  /* attributes; a quoted value may hold a ">" (the person's overrides) */
+  const attrs = String.raw`((?:[^>"']|"[^"]*"|'[^']*')*)`;
+  const has = (/** @type {string} */ text, /** @type {string} */ name) => new RegExp(`(?:^|\\s)${name}(?=[\\s=>]|$)`).test(text);
+  const out = [];
+  for (const [, track, inner] of body.matchAll(new RegExp(String.raw`<section\b${attrs}>([\s\S]*?)<\/section>`, 'g'))) {
+    for (const [, tag, own] of inner.matchAll(new RegExp(String.raw`<(iframe|video|img|audio)\b${attrs}>`, 'g'))) {
+      const attr = (/** @type {string} */ name) => {
+        const m = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`).exec(own);
+        return m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+      };
+      const src = attr('src');
+      if (!src) continue;
+      const [path, fragment = ''] = src.split('#');
+      const t = /t=([\d.]*)(?:,([\d.]+))?/.exec(fragment);
+      let file = path.replace(/&amp;/g, '&');
+      try { file = decodeURI(file); } catch { /* an escape that is not one: the path as written */ }
+      out.push({
+        tag, path: file, from: Number(t?.[1] || 0), to: t?.[2] ? Number(t[2]) : Infinity,
+        at: Number(attr('at') ?? 0), speed: Number(attr('speed') ?? 1),
+        shown: !has(track, 'hidden') && !has(own, 'hidden'),
+        heard: !has(track, 'hidden') && !has(track, 'muted') && !has(own, 'muted') && Number(attr('volume') ?? 1) > 0,
+      });
+    }
+  }
+  return out;
+}
+
+/** The remake's words: its clips' transcripts, placed where the clips play. @param {string} html */
+function filmWords(html) {
+  /** @type {Word[]} */
+  const words = [];
+  for (const c of clips(html)) {
+    if (!c.heard || (c.tag !== 'audio' && c.tag !== 'video')) continue;
+    const vtt = join(dirname(html), transcriptOf(c.path));
+    if (!existsSync(vtt)) continue;
+    for (const w of vttWords(readFileSync(vtt, 'utf8'))) {
+      if (w.t < c.from || w.t >= c.to) continue;
+      words.push({ text: w.text, t: c.at + (w.t - c.from) / c.speed, end: c.at + (Math.min(w.end, c.to) - c.from) / c.speed });
+    }
+  }
+  return words.sort((a, b) => a.t - b.t);
+}
+
+/** film.html for a render: the folder it is in or any above it, else the working folder. @param {string} video */
+function findFilm(video) {
+  for (let dir = dirname(resolve(video)); ; dir = dirname(dir)) {
+    if (existsSync(join(dir, 'film.html'))) return join(dir, 'film.html');
+    if (dirname(dir) === dir) break;
+  }
+  return existsSync('film.html') ? resolve('film.html') : null;
+}
+
+/** Clips in film.html that are the reference: under references/, the same bytes, or a page that names references/. @param {string} html @param {string} reference */
+function leakedFiles(html, reference) {
+  const dir = dirname(html);
+  const size = statSync(reference).size;
+  const digest = (/** @type {string} */ f) => createHash('sha1').update(readFileSync(f)).digest('hex');
+  let refDigest = '';
+  const found = [];
+  for (const c of clips(html)) {
+    const file = resolve(dir, c.path);
+    const rel = relative(dir, file).replace(/\\/g, '/');
+    if (rel.startsWith('references/') || file === resolve(reference)) { found.push(rel); continue; }
+    if (!existsSync(file) || !statSync(file).isFile()) continue;
+    if (c.tag === 'iframe') {
+      if (/["'(/]references\//.test(readFileSync(file, 'utf8').replace(/<!--[\s\S]*?-->/g, ''))) found.push(rel);
+      continue;
+    }
+    if (statSync(file).size !== size) continue;
+    refDigest ||= digest(reference);
+    if (digest(file) === refDigest) found.push(rel);
+  }
+  return [...new Set(found)];
+}
+
+/** The tokens words are compared by: each CJK character, each other word, lowercased, no punctuation. @param {Word[]} words */
+function tokens(words) {
+  const out = [];
+  for (const w of words) {
+    for (const m of w.text.toLowerCase().matchAll(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[\p{L}\p{N}]+/gu)) {
+      out.push({ text: m[0], t: w.t, cjk: m[0].length === 1 && /[^\p{Script=Latin}\p{N}]/u.test(m[0]) });
+    }
+  }
+  return out;
+}
+
+/** How much of the remake's wording is the reference's: its shared 6-token runs, and the longest run. @param {Word[]} ref @param {Word[]} remake */
+function sharedWords(ref, remake) {
+  const a = tokens(ref), b = tokens(remake);
+  const grams = (/** @type {{ text: string }[]} */ list) => list.slice(0, Math.max(0, list.length - 5)).map((_, i) => list.slice(i, i + 6).map((x) => x.text).join(' '));
+  const refGrams = new Set(grams(a));
+  const mine = grams(b);
+  const shared = mine.filter((g) => refGrams.has(g)).length;
+  let best = { length: 0, i: 0, j: 0 };
+  let prev = new Uint32Array(b.length + 1);
+  for (let i = 1; i <= a.length; i++) {
+    const row = new Uint32Array(b.length + 1);
+    for (let j = 1; j <= b.length; j++) {
+      if (a[i - 1].text !== b[j - 1].text) continue;
+      row[j] = prev[j - 1] + 1;
+      if (row[j] > best.length) best = { length: row[j], i: i - row[j], j: j - row[j] };
+    }
+    prev = row;
+  }
+  const run = b.slice(best.j, best.j + best.length);
+  const cjk = run.filter((x) => x.cjk).length > run.length / 2;
+  return {
+    share: round(mine.length ? shared / mine.length : 0, 2), run: run.map((x) => x.text).join(cjk ? '' : ' '), length: best.length, cjk,
+    at: round(run[0]?.t ?? 0), refAt: round(a[best.i]?.t ?? 0), long: best.length >= (cjk ? RUN_CJK : RUN_WORDS),
+  };
+}
+
+/**
+ * What of the reference is in the remake: its frames (re-encoded, cropped to fill or fitted with bars), its sound, a
+ * clip pointing into references/, and runs of its words. A frame that alike where only pages play is told apart: a
+ * copy drawn frame for frame, not the reference's footage.
+ * @param {string} refFile @param {string} remakeFile @param {{ width: number, height: number, fps: number, sound: boolean }} ref
+ * @param {{ width: number, height: number, sound: boolean }} mine @param {string} [film]
+ */
+async function findLeaks(refFile, remakeFile, ref, mine, film) {
+  const ratio = (mine.width / mine.height) / (ref.width / ref.height);
+  /* the reference cropped to fill the remake's frame, and the part of the remake a whole reference with bars would take */
+  const fill = Math.abs(ratio - 1) < 0.03 ? undefined : ratio < 1 ? { x: (1 - ratio) / 2, y: 0, w: ratio, h: 1 } : { x: 0, y: (1 - 1 / ratio) / 2, w: 1, h: 1 / ratio };
+  const fit = !fill ? undefined : ratio < 1 ? { x: 0, y: (1 - ratio) / 2, w: 1, h: ratio } : { x: (1 - 1 / ratio) / 2, y: 0, w: 1 / ratio, h: 1 };
+  const html = film ? resolve(film) : findFilm(remakeFile);
+  if (html && !existsSync(html)) throw new Error(`${html}: no such file`);
+  const [refPrints, minePrints] = await Promise.all([readPrints(refFile, ref.fps, fill), readPrints(remakeFile, ref.fps, fit)]);
+  const footage = html ? clips(html).filter((c) => c.shown && (c.tag === 'video' || c.tag === 'img')) : [];
+  const playsAt = (/** @type {{ from: number, to: number }} */ p) => footage.some((c) => c.at <= p.to + 0.1 && c.at + (c.to - c.from) / c.speed >= p.from - 0.1);
+  const seen = leakedPictures(refPrints, minePrints);
+  const pictures = seen.filter((p) => !html || playsAt(p));
+  const drawn = seen.filter((p) => html && !playsAt(p));
+  let sound = /** @type {ReturnType<typeof leakedSound>} */ ([]);
+  if (ref.sound && mine.sound) {
+    const [a, b] = await Promise.all([readSound(refFile, LEAK_RATE), readSound(remakeFile, LEAK_RATE)]);
+    sound = leakedSound(landmarks(spectrum(a)), landmarks(spectrum(b)));
+  }
+  const refVtt = transcriptOf(refFile), mineVtt = transcriptOf(remakeFile);
+  const refWords = existsSync(refVtt) ? vttWords(readFileSync(refVtt, 'utf8')) : null;
+  let mineWords = existsSync(mineVtt) ? vttWords(readFileSync(mineVtt, 'utf8')) : html ? filmWords(html) : null;
+  if (mineWords && !mineWords.length) mineWords = null;
+  const span = (/** @type {{ from: number, to: number, refFrom: number, count: number, score: number }} */ s) => ({ from: round(s.from), to: round(s.to), refFrom: round(s.refFrom), count: s.count, score: round(s.score, 2) });
+  return {
+    film: html, frames: minePrints.length,
+    pictures: pictures.map(span), drawn: drawn.map(span), sound: sound.map(span), files: html ? leakedFiles(html, refFile) : [],
+    words: refWords && mineWords ? sharedWords(refWords, mineWords) : null,
+    wordsMissing: !refWords ? refVtt : !mineWords ? mineVtt : null,
+  };
+}
+
+/** @param {string} refFile @param {string} remakeFile @param {{ out?: string, fit?: boolean, film?: string }} o */
+async function compare(refFile, remakeFile, { out, fit = false, film }) {
   const ref = probe(refFile);
   const mine = probe(remakeFile);
   const size = analysisSize(ref.width, ref.height);
@@ -780,6 +1229,9 @@ async function compare(refFile, remakeFile, { out, fit = false }) {
   const issues = motion.filter((m) => m.issue).slice(0, 8).map((m) => ({ ...m, picture: picture((m.from + m.to) / 2) }));
   const missedCuts = cuts.missing.slice(0, 4).map((t) => ({ at: t, picture: picture(t + frame / 2) }));
 
+  const leaks = await findLeaks(refFile, remakeFile, ref, mine, film);
+  const leaked = leaks.pictures.length + leaks.sound.length + leaks.files.length > 0;
+
   const frames = (/** @type {number} */ s) => Math.abs(s) * ref.fps;
   const within = (/** @type {{ pairs: Array<{ off: number }> }} */ m, /** @type {number} */ k) => m.pairs.filter((p) => frames(p.off) <= k + 0.01).length;
   const summary = (/** @type {{ pairs: Array<{ off: number }>, missing: number[], extra: number[] }} */ m, /** @type {number} */ total, /** @type {number} */ k) => {
@@ -801,6 +1253,7 @@ async function compare(refFile, remakeFile, { out, fit = false }) {
       ssim: round(mean(perFrame.map((f) => f.ssim))), colour: round(mean(perFrame.map((f) => f.colour))),
       palette: round(mean(shots.map((x) => x.palette)), 2), layout: round(mean(shots.map((x) => x.layout)), 2), shots, worst: worstShown,
     },
+    leaks,
   };
   writeFileSync(join(folder, 'compare.json'), `${JSON.stringify(json, null, 1)}\n`);
 
@@ -842,9 +1295,25 @@ async function compare(refFile, remakeFile, { out, fit = false }) {
     `Least alike: ${worstShown.map((w) => `${fmt(w.at)} (${w.ssim}${w.picture ? `, ${w.picture}` : ''})`).join(' · ')}`,
     '',
   ];
+  lines.push('## The reference in the remake', '');
+  if (leaked) lines.push('None of this goes in unless the person said it may:', '');
+  else lines.push(`No picture, sound or file of the reference (${leaks.frames} frames checked, ${leaks.film ? 'film.html read' : 'no film.html found'}).`, '');
+  for (const f of leaks.files) lines.push(`- file: film.html plays ${f}`);
+  for (const p of leaks.pictures) lines.push(`- picture: ${fmt(p.from)}–${fmt(p.to)} shows the reference's frames from ${fmt(p.refFrom)} (pixels ${p.score} alike)`);
+  for (const s of leaks.sound) lines.push(`- sound: ${fmt(s.from)}–${fmt(s.to)} plays the reference's sound from ${fmt(s.refFrom)} (${s.count} landmarks)`);
+  for (const p of leaks.drawn) lines.push(`- drawn: ${fmt(p.from)}–${fmt(p.to)} is as alike as its frames from ${fmt(p.refFrom)}, with only pages playing: a copy drawn frame for frame`);
+  if (leaks.words) {
+    const said = leaks.words.length ? `longest shared run ${leaks.words.length} ${leaks.words.cjk ? 'characters' : 'words'} at ${fmt(leaks.words.at)}, 「${leaks.words.run}」` : 'no shared run';
+    lines.push(`- words: ${Math.round(leaks.words.share * 100)}% of the remake's 6-token runs are the reference's; ${said}${leaks.words.long || leaks.words.share > 0.2 ? '. Only right when the person asked for the same words' : ''}`);
+  } else {
+    lines.push(`- words: not measured, no ${leaks.wordsMissing} (npx openfilm get asr)`);
+  }
+  lines.push('');
   writeFileSync(join(folder, 'compare.md'), lines.join('\n'));
   console.log(`cuts ${t.cuts.within}/${t.cuts.total}, starts ${t.starts.within}/${t.starts.total}, rhythm ${t.rhythm}, palette ${json.pictures.palette}, layout ${json.pictures.layout}, SSIM ${json.pictures.ssim}`);
+  if (leaked) console.log(`THE REFERENCE IS IN THE REMAKE: ${leaks.files.length} file, ${leaks.pictures.length} picture, ${leaks.sound.length} sound; see its section`);
   console.log(`→ ${relative(process.cwd(), join(folder, 'compare.md')) || join(folder, 'compare.md')}`);
+  if (leaked) process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------- command
@@ -861,11 +1330,12 @@ const fitAt = args.indexOf('--fit');
 const fitIt = fitAt >= 0;
 if (fitIt) args.splice(fitAt, 1);
 const out = flag('--out');
+const film = flag('--film');
 const [command, ...files] = args;
 try {
   if (command === 'study' && files.length === 1) await study(files[0], out);
-  else if (command === 'compare' && files.length === 2) await compare(files[0], files[1], { out, fit: fitIt });
-  else fail('node measure.mjs study <video> [--out <folder>]\n       node measure.mjs compare <reference> <remake> [--out <folder>] [--fit]');
+  else if (command === 'compare' && files.length === 2) await compare(files[0], files[1], { out, fit: fitIt, film });
+  else fail('node measure.mjs study <video> [--out <folder>]\n       node measure.mjs compare <reference> <remake> [--out <folder>] [--fit] [--film <film.html>]');
 } catch (e) {
   fail(e instanceof Error ? e.message : String(e));
 }

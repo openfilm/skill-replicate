@@ -2,6 +2,13 @@
 
 Newest first. Each version is the one in `skills/replicate/openfilm.json`, and is tagged `v<version>`.
 
+## 0.1.3
+
+`compare` says what of the reference is in the remake, and exits 1 when a picture, a sound or a file of it is: its frames
+(re-encoded, cropped to fill or fitted with bars), its sound, even under another, a clip pointing into `references/` or a
+copy of it, a page that plays it. Runs of its words are told and do not fail it. Frames as alike with only pages playing
+are told apart as a copy drawn frame for frame. `evals/reference-in-the-remake.test.mjs` tries each on videos ffmpeg draws.
+
 ## 0.1.2
 
 The reference's subject is content. Name first what it shows and sells (whose product, app, brand or story), then show
